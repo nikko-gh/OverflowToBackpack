@@ -1,19 +1,19 @@
 ﻿/*
- * Copyright (C) 2024 Game4Freak.io
+ * Copyright (C) 2026 Game4Freak.io
  * This mod is provided under the Game4Freak EULA.
  * Full legal terms can be found at https://game4freak.io/eula/
  */
 
 using Newtonsoft.Json;
 using Oxide.Core;
+using Oxide.Core.Plugins;
 using System.Collections.Generic;
-using System.IO;
 using UnityEngine;
 
 namespace Oxide.Plugins
 {
-    [Info("Overflow To Backpack", "VisEntities", "1.3.1")]
-    [Description("Sends overflow items to your backpack when your inventory is full.")]
+    [Info("Overflow To Backpack", "VisEntities", "1.4.0")]
+    [Description("Automatically moves items to your backpack when your inventory runs out of space.")]
     public class OverflowToBackpack : RustPlugin
     {
         #region Fields
@@ -21,6 +21,9 @@ namespace Oxide.Plugins
         private static OverflowToBackpack _plugin;
         private static Configuration _config;
         private StoredData _storedData;
+
+        [PluginReference]
+        private Plugin Backpacks;
 
         #endregion Fields
 
@@ -31,23 +34,26 @@ namespace Oxide.Plugins
             [JsonProperty("Version")]
             public string Version { get; set; }
 
-            [JsonProperty("Enable Gathered Resources")]
-            public bool EnableGatheredResources { get; set; }
+            [JsonProperty("Enable Overflow For Gathered Resources (ores, wood, etc.)")]
+            public bool EnableOverflowForGatheredResources { get; set; }
 
-            [JsonProperty("Enable Collectibles")]
-            public bool EnableCollectibles { get; set; }
+            [JsonProperty("Enable Overflow For Collectible Pickups (hemp, mushrooms, etc.)")]
+            public bool EnableOverflowForCollectiblePickups { get; set; }
 
-            [JsonProperty("Enable Dropped Items")]
-            public bool EnableDroppedItems { get; set; }
-            
-            [JsonProperty("Enable Looted Items")]
-            public bool EnableLootedItems { get; set; }
+            [JsonProperty("Enable Overflow For Dropped Item Pickups")]
+            public bool EnableOverflowForDroppedItemPickups { get; set; }
 
-            [JsonProperty("Send Game Tip Notification")]
-            public bool SendGameTipNotification { get; set; }
+            [JsonProperty("Enable Overflow For Looted Items (from containers)")]
+            public bool EnableOverflowForLootedItems { get; set; }
 
-            [JsonProperty("Overflow Toggle Chat Command")]
-            public string OverflowToggleChatCommand { get; set; }
+            [JsonProperty("Show Game Tip When Items Overflow To Backpack")]
+            public bool ShowGameTipWhenItemsOverflowToBackpack { get; set; }
+
+            [JsonProperty("Chat Command To Toggle Overflow (without slash)")]
+            public string ChatCommandToToggleOverflow { get; set; }
+
+            [JsonProperty("Backpack Provider (Vanilla, BackpacksPlugin, Both)")]
+            public string BackpackProvider { get; set; }
         }
 
         protected override void LoadConfig()
@@ -80,20 +86,8 @@ namespace Oxide.Plugins
             if (string.Compare(_config.Version, "1.0.0") < 0)
                 _config = defaultConfig;
 
-            if (string.Compare(_config.Version, "1.1.0") < 0)
-            {
-                _config.EnableLootedItems = defaultConfig.EnableLootedItems;
-            }
-
-            if (string.Compare(_config.Version, "1.2.0") < 0)
-            {
-                _config.SendGameTipNotification = defaultConfig.SendGameTipNotification;
-            }
-
-            if (string.Compare(_config.Version, "1.3.0") < 0)
-            {
-                _config.OverflowToggleChatCommand = defaultConfig.OverflowToggleChatCommand;
-            }
+            if (string.Compare(_config.Version, "1.4.0") < 0)
+                _config = defaultConfig;
 
             PrintWarning("Config update complete! Updated from version " + _config.Version + " to " + Version.ToString());
             _config.Version = Version.ToString();
@@ -104,26 +98,44 @@ namespace Oxide.Plugins
             return new Configuration
             {
                 Version = Version.ToString(),
-                EnableGatheredResources = true,
-                EnableCollectibles = true,
-                EnableDroppedItems = true,
-                EnableLootedItems = true,
-                SendGameTipNotification = true,
-                OverflowToggleChatCommand = "overflow"
+                EnableOverflowForGatheredResources = true,
+                EnableOverflowForCollectiblePickups = true,
+                EnableOverflowForDroppedItemPickups = true,
+                EnableOverflowForLootedItems = true,
+                ShowGameTipWhenItemsOverflowToBackpack = true,
+                ChatCommandToToggleOverflow = "overflow",
+                BackpackProvider = "Vanilla"
             };
         }
 
         #endregion Configuration
 
-        #region Stored Data
+        #region Data
 
-        public class StoredData
+        private class StoredData
         {
-            [JsonProperty("Overflow Enabled")]
-            public Dictionary<ulong, bool> OverflowEnabled = new Dictionary<ulong, bool>();
+            [JsonProperty("Preferences")]
+            public Dictionary<ulong, bool> Preferences = new Dictionary<ulong, bool>();
         }
 
-        #endregion Stored Data
+        private StoredData LoadData()
+        {
+            if (Interface.Oxide.DataFileSystem.ExistsDatafile(Name))
+            {
+                StoredData loaded = Interface.Oxide.DataFileSystem.ReadObject<StoredData>(Name);
+                if (loaded != null)
+                    return loaded;
+            }
+
+            return new StoredData();
+        }
+
+        private void SaveData()
+        {
+            Interface.Oxide.DataFileSystem.WriteObject(Name, _storedData);
+        }
+
+        #endregion Data
 
         #region Oxide Hooks
 
@@ -131,23 +143,39 @@ namespace Oxide.Plugins
         {
             _plugin = this;
             PermissionUtil.RegisterPermissions();
-            _storedData = DataFileUtil.LoadOrCreate<StoredData>(DataFileUtil.GetFilePath());
-            cmd.AddChatCommand(_config.OverflowToggleChatCommand, this, nameof(cmdToggleOverflow));
+            _storedData = LoadData();
+            cmd.AddChatCommand(_config.ChatCommandToToggleOverflow, this, nameof(cmdToggleOverflow));
 
-            if (!_config.EnableGatheredResources)
+            string provider = _config.BackpackProvider;
+            if (provider != "Vanilla" && provider != "BackpacksPlugin" && provider != "Both")
+            {
+                PrintWarning($"Invalid BackpackProvider value '{provider}'. Defaulting to 'Vanilla'.");
+                _config.BackpackProvider = "Vanilla";
+            }
+
+            if (!_config.EnableOverflowForGatheredResources)
             {
                 Unsubscribe(nameof(OnDispenserGather));
                 Unsubscribe(nameof(OnDispenserBonus));
             }
 
-            if (!_config.EnableCollectibles)
+            if (!_config.EnableOverflowForCollectiblePickups)
                 Unsubscribe(nameof(OnCollectiblePickup));
 
-            if (!_config.EnableDroppedItems)
+            if (!_config.EnableOverflowForDroppedItemPickups)
                 Unsubscribe(nameof(OnItemPickup));
 
-            if (!_config.EnableLootedItems)
+            if (!_config.EnableOverflowForLootedItems)
                 Unsubscribe(nameof(CanMoveItem));
+        }
+
+        private void OnServerInitialized()
+        {
+            string provider = _config.BackpackProvider;
+            if ((provider == "BackpacksPlugin" || provider == "Both") && !IsBackpacksPluginAvailable())
+            {
+                PrintWarning("Backpack Provider is set to '" + provider + "' but the Backpacks plugin is not loaded. Overflow to Backpacks plugin will be skipped until it loads.");
+            }
         }
 
         private void Unload()
@@ -161,10 +189,10 @@ namespace Oxide.Plugins
             if (player == null || item == null)
                 return null;
 
-            if (!PermissionUtil.HasPermission(player, PermissionUtil.USE) || !OverflowEnabledFor(player))
+            if (!PermissionUtil.HasPermission(player, PermissionUtil.USE) || !PreferencesFor(player))
                 return null;
 
-            if (!HasBackpack(player))
+            if (!HasAnyBackpack(player))
                 return null;
 
             if (!PlayerInventoryFull(player, item))
@@ -174,12 +202,12 @@ namespace Oxide.Plugins
             Item newItem = ItemManager.Create(item.info, originalAmount, item.skin);
             if (newItem != null)
             {
-                bool moved = TryMoveItemToBackpack(player, newItem, originalAmount);
-                if (moved)
+                if (TryMoveItemToBackpack(player, newItem, originalAmount))
                     return true;
-                else
-                    newItem.Remove();
+
+                newItem.Remove();
             }
+
             return null;
         }
 
@@ -188,22 +216,22 @@ namespace Oxide.Plugins
             if (player == null || item == null)
                 return;
 
-            if (!PermissionUtil.HasPermission(player, PermissionUtil.USE) || !OverflowEnabledFor(player))
+            if (!PermissionUtil.HasPermission(player, PermissionUtil.USE) || !PreferencesFor(player))
                 return;
 
-            if (!HasBackpack(player))
+            if (!HasAnyBackpack(player))
                 return;
 
             if (!PlayerInventoryFull(player, item))
                 return;
 
             int originalAmount = item.amount;
-            _plugin.NextTick(() =>
+            NextTick(() =>
             {
-                if (player == null || item == null || !HasBackpack(player))
+                if (player == null || item == null || item.info == null || item.amount <= 0 || !HasAnyBackpack(player))
                     return;
 
-                bool moved = TryMoveItemToBackpack(player, item, originalAmount);
+                TryMoveItemToBackpack(player, item, originalAmount);
             });
         }
 
@@ -212,59 +240,61 @@ namespace Oxide.Plugins
             if (player == null || collectible == null || collectible.itemList == null)
                 return null;
 
-            if (!PermissionUtil.HasPermission(player, PermissionUtil.USE) || !OverflowEnabledFor(player))
+            if (!PermissionUtil.HasPermission(player, PermissionUtil.USE) || !PreferencesFor(player))
                 return null;
 
-            Item backpackItem = player.inventory.GetBackpackWithInventory();
-            if (backpackItem == null || backpackItem.contents == null)
-                return null;
+            string provider = _config.BackpackProvider;
+            bool useVanilla = provider == "Vanilla" || provider == "Both";
+            bool usePlugin = provider == "BackpacksPlugin" || provider == "Both";
 
-            ItemContainer backpack = backpackItem.contents;
+            ItemContainer vanillaContainer = null;
+            ItemContainer pluginContainer = null;
+
+            if (useVanilla)
+            {
+                Item backpackItem = player.inventory.GetBackpackWithInventory();
+                if (backpackItem != null && backpackItem.contents != null)
+                    vanillaContainer = backpackItem.contents;
+            }
+
+            if (usePlugin && IsBackpacksPluginAvailable())
+                pluginContainer = GetBackpacksPluginContainer(player);
+
+            if (vanillaContainer == null && pluginContainer == null)
+                return null;
 
             bool needOverride = false;
-            int freeSlots = backpack.capacity - backpack.itemList.Count;
 
-            Dictionary<ItemDefinition, int> stackSpace = new Dictionary<ItemDefinition, int>();
-            foreach (Item existing in backpack.itemList)
+            bool vanillaFits = vanillaContainer != null && CollectibleFitsInContainer(vanillaContainer, collectible, player);
+            bool pluginFits = !vanillaFits && pluginContainer != null && CollectibleFitsInContainer(pluginContainer, collectible, player);
+
+            if (!vanillaFits && !pluginFits)
             {
-                if (existing.amount >= existing.info.stackable) continue;
+                foreach (var ia in collectible.itemList)
+                {
+                    int amount = (int)ia.amount;
+                    Item probe = ItemManager.Create(ia.itemDef, amount, 0UL, true);
+                    bool invFull = PlayerInventoryFull(player, probe);
+                    probe.Remove();
 
-                int spare = existing.info.stackable - existing.amount;
-                if (stackSpace.TryGetValue(existing.info, out int current))
-                    stackSpace[existing.info] = current + spare;
-                else
-                    stackSpace.Add(existing.info, spare);
+                    if (invFull)
+                        return null;
+                }
+
+                return null;
             }
 
             foreach (var ia in collectible.itemList)
             {
                 int amount = (int)ia.amount;
-                var itemDef = ia.itemDef;
-
-                Item probe = ItemManager.Create(itemDef, amount, 0UL, true);
+                Item probe = ItemManager.Create(ia.itemDef, amount, 0UL, true);
                 bool invFull = PlayerInventoryFull(player, probe);
                 probe.Remove();
 
-                if (!invFull)
-                    continue;
-
-                needOverride = true;
-
-                if (stackSpace.TryGetValue(itemDef, out int spareInStacks) && spareInStacks > 0)
+                if (invFull)
                 {
-                    int used = Mathf.Min(spareInStacks, amount);
-                    amount -= used;
-                    stackSpace[itemDef] = spareInStacks - used;
-                }
-
-                if (amount > 0)
-                {
-                    int stackSize = itemDef.stackable;
-                    int slotsNeeded = Mathf.CeilToInt(amount / (float)stackSize);
-
-                    freeSlots -= slotsNeeded;
-                    if (freeSlots < 0)
-                        return null;
+                    needOverride = true;
+                    break;
                 }
             }
 
@@ -290,18 +320,16 @@ namespace Oxide.Plugins
             if (player == null || item == null)
                 return null;
 
-            if (!PermissionUtil.HasPermission(player, PermissionUtil.USE) || !OverflowEnabledFor(player))
+            if (!PermissionUtil.HasPermission(player, PermissionUtil.USE) || !PreferencesFor(player))
                 return null;
 
-            if (!HasBackpack(player))
+            if (!HasAnyBackpack(player))
                 return null;
 
             if (!PlayerInventoryFull(player, item))
                 return null;
 
-            int originalAmount = item.amount;
-            bool moved = TryMoveItemToBackpack(player, item, originalAmount);
-            if (moved)
+            if (TryMoveItemToBackpack(player, item, item.amount))
                 return true;
 
             return null;
@@ -316,26 +344,32 @@ namespace Oxide.Plugins
             if (player == null)
                 return null;
 
-            if (!PermissionUtil.HasPermission(player, PermissionUtil.USE) || !OverflowEnabledFor(player))
+            if (!PermissionUtil.HasPermission(player, PermissionUtil.USE) || !PreferencesFor(player))
                 return null;
 
-            if (!HasBackpack(player))
+            if (!HasAnyBackpack(player))
                 return null;
 
             ItemContainer sourceContainer = item.parent;
-            bool isFromPlayerInventory = sourceContainer == player.inventory.containerMain ||
-                                         sourceContainer == player.inventory.containerBelt ||
-                                         (player.inventory.GetBackpackWithInventory() != null &&
-                                          sourceContainer == player.inventory.GetBackpackWithInventory().contents);
-
-            if (isFromPlayerInventory)
+            if (sourceContainer == player.inventory.containerMain ||
+                sourceContainer == player.inventory.containerBelt)
                 return null;
+
+            Item vanillaBackpackItem = player.inventory.GetBackpackWithInventory();
+            if (vanillaBackpackItem != null && sourceContainer == vanillaBackpackItem.contents)
+                return null;
+
+            if (IsBackpacksPluginAvailable())
+            {
+                ItemContainer pluginContainer = GetBackpacksPluginContainer(player);
+                if (pluginContainer != null && sourceContainer == pluginContainer)
+                    return null;
+            }
 
             if (!PlayerInventoryFull(player, item))
                 return null;
 
-            bool moved = TryMoveItemToBackpack(player, item, item.amount);
-            if (moved)
+            if (TryMoveItemToBackpack(player, item, item.amount))
                 return true;
 
             return null;
@@ -343,11 +377,84 @@ namespace Oxide.Plugins
 
         #endregion Oxide Hooks
 
-        #region Inventory Utilities
+        #region Helpers
 
-        private bool HasBackpack(BasePlayer player)
+        private bool IsBackpacksPluginAvailable()
         {
-            return player.inventory.GetBackpackWithInventory() != null;
+            return Backpacks != null && Backpacks.IsLoaded;
+        }
+
+        private ItemContainer GetBackpacksPluginContainer(BasePlayer player)
+        {
+            if (!IsBackpacksPluginAvailable())
+                return null;
+
+            return Backpacks.Call("API_GetBackpackContainer", player.userID) as ItemContainer;
+        }
+
+        private bool HasAnyBackpack(BasePlayer player)
+        {
+            string provider = _config.BackpackProvider;
+
+            if (provider == "Vanilla")
+                return player.inventory.GetBackpackWithInventory() != null;
+
+            if (provider == "BackpacksPlugin")
+                return IsBackpacksPluginAvailable() && GetBackpacksPluginContainer(player) != null;
+
+            if (player.inventory.GetBackpackWithInventory() != null)
+                return true;
+
+            return IsBackpacksPluginAvailable() && GetBackpacksPluginContainer(player) != null;
+        }
+
+        private bool CollectibleFitsInContainer(ItemContainer container, CollectibleEntity collectible, BasePlayer player)
+        {
+            int freeSlots = container.capacity - container.itemList.Count;
+
+            Dictionary<ItemDefinition, int> stackSpace = new Dictionary<ItemDefinition, int>();
+            foreach (Item existing in container.itemList)
+            {
+                if (existing.amount >= existing.info.stackable) continue;
+
+                int spare = existing.info.stackable - existing.amount;
+                if (stackSpace.TryGetValue(existing.info, out int current))
+                    stackSpace[existing.info] = current + spare;
+                else
+                    stackSpace.Add(existing.info, spare);
+            }
+
+            foreach (var ia in collectible.itemList)
+            {
+                int amount = (int)ia.amount;
+                var itemDef = ia.itemDef;
+
+                Item probe = ItemManager.Create(itemDef, amount, 0UL, true);
+                bool invFull = PlayerInventoryFull(player, probe);
+                probe.Remove();
+
+                if (!invFull)
+                    continue;
+
+                if (stackSpace.TryGetValue(itemDef, out int spareInStacks) && spareInStacks > 0)
+                {
+                    int used = Mathf.Min(spareInStacks, amount);
+                    amount -= used;
+                    stackSpace[itemDef] = spareInStacks - used;
+                }
+
+                if (amount > 0)
+                {
+                    int stackSize = itemDef.stackable;
+                    int slotsNeeded = Mathf.CeilToInt(amount / (float)stackSize);
+
+                    freeSlots -= slotsNeeded;
+                    if (freeSlots < 0)
+                        return false;
+                }
+            }
+
+            return true;
         }
 
         private bool PlayerInventoryFull(BasePlayer player, Item item)
@@ -357,6 +464,7 @@ namespace Oxide.Plugins
 
             if (ContainerHasSpaceForItem(player.inventory.containerBelt, item))
                 return false;
+
             return true;
         }
 
@@ -368,130 +476,83 @@ namespace Oxide.Plugins
                     return true;
             }
 
-            if (container.itemList.Count < container.capacity)
-                return true;
-
-            return false;
+            return container.itemList.Count < container.capacity;
         }
 
         private bool TryMoveItemToBackpack(BasePlayer player, Item item, int amount)
         {
+            string provider = _config.BackpackProvider;
+
+            if (provider == "Vanilla")
+                return TryMoveToVanillaBackpack(player, item, amount);
+
+            if (provider == "BackpacksPlugin")
+                return TryMoveToBackpacksPlugin(player, item, amount);
+
+            if (TryMoveToVanillaBackpack(player, item, amount))
+                return true;
+
+            return TryMoveToBackpacksPlugin(player, item, amount);
+        }
+
+        private bool TryMoveToVanillaBackpack(BasePlayer player, Item item, int amount)
+        {
             Item backpack = player.inventory.GetBackpackWithInventory();
-            if (backpack == null)
+            if (backpack == null || backpack.contents == null)
                 return false;
 
             if (!ContainerHasSpaceForItem(backpack.contents, item))
                 return false;
 
             bool moved = item.MoveToContainer(backpack.contents, allowStack: true);
-            if (moved)
-            {
-                if (_config.SendGameTipNotification)
-                {
-                    ShowToast(player, Lang.BackpackReceived, GameTip.Styles.Blue_Normal, amount, item.info.displayName.translated);
-                }
-            }
+            if (moved && _config.ShowGameTipWhenItemsOverflowToBackpack)
+                SendToastLocalized(player, Lang.Notification_ItemOverflowed, GameTip.Styles.Blue_Normal, amount, item.info.displayName.translated);
+
             return moved;
         }
 
-        #endregion Inventory Utilities
-
-        #region Helper Functions
-
-        private bool OverflowEnabledFor(BasePlayer player)
+        private bool TryMoveToBackpacksPlugin(BasePlayer player, Item item, int amount)
         {
-            if (!_storedData.OverflowEnabled.TryGetValue(player.userID, out bool isEnabled))
+            if (!IsBackpacksPluginAvailable())
+                return false;
+
+            ItemContainer container = GetBackpacksPluginContainer(player);
+            if (container == null)
+                return false;
+
+            if (!ContainerHasSpaceForItem(container, item))
+                return false;
+
+            PauseBackpacksPluginGatherMode(player);
+
+            bool moved = item.MoveToContainer(container, allowStack: true);
+            if (moved && _config.ShowGameTipWhenItemsOverflowToBackpack)
+                SendToastLocalized(player, Lang.Notification_ItemOverflowed, GameTip.Styles.Blue_Normal, amount, item.info.displayName.translated);
+
+            return moved;
+        }
+
+        private void PauseBackpacksPluginGatherMode(BasePlayer player)
+        {
+            if (!IsBackpacksPluginAvailable())
+                return;
+
+            Backpacks.Call("API_PauseBackpackGatherMode", player.userID, 0f);
+        }
+
+        private bool PreferencesFor(BasePlayer player)
+        {
+            if (!_storedData.Preferences.TryGetValue(player.userID, out bool isEnabled))
             {
                 isEnabled = true;
-                _storedData.OverflowEnabled[player.userID] = true;
-                DataFileUtil.Save(DataFileUtil.GetFilePath(), _storedData);
+                _storedData.Preferences[player.userID] = true;
+                SaveData();
             }
+
             return isEnabled;
         }
 
-        #endregion Helper Functions
-
-        #region Helper Classes
-
-        public static class DataFileUtil
-        {
-            private const string FOLDER = "";
-
-            public static void EnsureFolderCreated()
-            {
-                string path = Path.Combine(Interface.Oxide.DataDirectory, FOLDER);
-
-                if (!Directory.Exists(path))
-                    Directory.CreateDirectory(path);
-            }
-
-            public static string GetFilePath(string filename = null)
-            {
-                if (filename == null)
-                    filename = _plugin.Name;
-
-                return Path.Combine(FOLDER, filename);
-            }
-
-            public static string[] GetAllFilePaths(bool filenameOnly = false)
-            {
-                string[] filePaths = Interface.Oxide.DataFileSystem.GetFiles(FOLDER);
-
-                for (int i = 0; i < filePaths.Length; i++)
-                {
-                    filePaths[i] = filePaths[i].Substring(0, filePaths[i].Length - 5);
-
-                    if (filenameOnly)
-                    {
-                        filePaths[i] = Path.GetFileName(filePaths[i]);
-                    }
-                }
-                return filePaths;
-            }
-
-            public static bool Exists(string filePath)
-            {
-                return Interface.Oxide.DataFileSystem.ExistsDatafile(filePath);
-            }
-
-            public static T Load<T>(string filePath) where T : class, new()
-            {
-                T data = Interface.Oxide.DataFileSystem.ReadObject<T>(filePath);
-                if (data == null)
-                    data = new T();
-
-                return data;
-            }
-
-            public static T LoadIfExists<T>(string filePath) where T : class, new()
-            {
-                if (Exists(filePath))
-                    return Load<T>(filePath);
-                else
-                    return null;
-            }
-
-            public static T LoadOrCreate<T>(string filePath) where T : class, new()
-            {
-                T data = LoadIfExists<T>(filePath);
-                if (data == null)
-                    data = new T();
-
-                return data;
-            }
-
-            public static void Save<T>(string filePath, T data)
-            {
-                Interface.Oxide.DataFileSystem.WriteObject<T>(filePath, data);
-            }
-
-            public static void Delete(string filePath)
-            {
-                Interface.Oxide.DataFileSystem.DeleteDataFile(filePath);
-            }
-        }
-
-        #endregion Helper Classes
+        #endregion Helpers
 
         #region Permissions
 
@@ -528,51 +589,52 @@ namespace Oxide.Plugins
 
             if (!PermissionUtil.HasPermission(player, PermissionUtil.USE))
             {
-                MessagePlayer(player, Lang.NoPermission);
+                SendReplyLocalized(player, Lang.Error_NoPermission);
                 return;
             }
 
-            ulong userId = player.userID;
-
-            bool oldValue = OverflowEnabledFor(player);
-            bool newValue = !oldValue;
-
-            _storedData.OverflowEnabled[userId] = newValue;
-            DataFileUtil.Save(DataFileUtil.GetFilePath(), _storedData);
+            bool newValue = !PreferencesFor(player);
+            _storedData.Preferences[player.userID] = newValue;
+            SaveData();
 
             if (newValue)
-                MessagePlayer(player, Lang.ToggleOn);
+                SendReplyLocalized(player, Lang.Toggle_Enabled);
             else
-                MessagePlayer(player, Lang.ToggleOff);
+                SendReplyLocalized(player, Lang.Toggle_Disabled);
         }
-        
+
         #endregion Commands
 
         #region Localization
 
         private class Lang
         {
-            public const string NoPermission = "NoPermission";
-            public const string BackpackReceived = "BackpackReceived";
-            public const string ToggleOn = "ToggleOn";
-            public const string ToggleOff = "ToggleOff";
+            public const string Error_NoPermission = "Error.NoPermission";
+            public const string Notification_ItemOverflowed = "Notification.ItemOverflowed";
+            public const string Toggle_Enabled = "Toggle.Enabled";
+            public const string Toggle_Disabled = "Toggle.Disabled";
         }
 
         protected override void LoadDefaultMessages()
         {
             lang.RegisterMessages(new Dictionary<string, string>
             {
-                [Lang.NoPermission] = "You do not have permission to use this command.",
-                [Lang.BackpackReceived] = "Your inventory is full! {0} {1} has been moved to your backpack.",
-                [Lang.ToggleOn] = "Overflow to backpack is now enabled.",
-                [Lang.ToggleOff] = "Overflow to backpack is now disabled."
-
+                [Lang.Error_NoPermission] = "You do not have permission to use this.",
+                [Lang.Notification_ItemOverflowed] = "Inventory full. {0}x {1} moved to backpack.",
+                [Lang.Toggle_Enabled] = "Backpack overflow is now enabled.",
+                [Lang.Toggle_Disabled] = "Backpack overflow is now disabled."
             }, this, "en");
         }
 
-        private static string GetMessage(BasePlayer player, string messageKey, params object[] args)
+        private static string GetLangText(BasePlayer player, string langKey, params object[] args)
         {
-            string message = _plugin.lang.GetMessage(messageKey, _plugin, player.UserIDString);
+            string userId;
+            if (player != null)
+                userId = player.UserIDString;
+            else
+                userId = null;
+
+            string message = _plugin.lang.GetMessage(langKey, _plugin, userId);
 
             if (args.Length > 0)
                 message = string.Format(message, args);
@@ -580,16 +642,20 @@ namespace Oxide.Plugins
             return message;
         }
 
-        public static void MessagePlayer(BasePlayer player, string messageKey, params object[] args)
+        public static void SendReplyLocalized(BasePlayer player, string langKey, params object[] args)
         {
-            string message = GetMessage(player, messageKey, args);
-            _plugin.SendReply(player, message);
+            string message = GetLangText(player, langKey, args);
+
+            if (!string.IsNullOrWhiteSpace(message))
+                _plugin.SendReply(player, message);
         }
 
-        public static void ShowToast(BasePlayer player, string messageKey, GameTip.Styles style = GameTip.Styles.Blue_Normal, params object[] args)
+        public static void SendToastLocalized(BasePlayer player, string langKey, GameTip.Styles style = GameTip.Styles.Blue_Normal, params object[] args)
         {
-            string message = GetMessage(player, messageKey, args);
-            player.SendConsoleCommand("gametip.showtoast", (int)style, message);
+            string message = GetLangText(player, langKey, args);
+
+            if (!string.IsNullOrWhiteSpace(message))
+                player.SendConsoleCommand("gametip.showtoast", (int)style, message);
         }
 
         #endregion Localization
