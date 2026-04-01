@@ -474,6 +474,9 @@ namespace Oxide.Plugins
             {
                 if (existing.info == item.info && existing.amount < existing.info.stackable)
                     return true;
+
+                if (existing.contents != null && existing.info.volume <= 4 && !existing.contents.IsFull())
+                    return true;
             }
 
             return container.itemList.Count < container.capacity;
