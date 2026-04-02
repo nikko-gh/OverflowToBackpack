@@ -335,7 +335,7 @@ namespace Oxide.Plugins
             return null;
         }
 
-        private object CanMoveItem(Item item, PlayerInventory playerInventory)
+        private object CanMoveItem(Item item, PlayerInventory playerInventory, ItemContainerId itemContainerId)
         {
             if (item == null || playerInventory == null)
                 return null;
@@ -366,7 +366,7 @@ namespace Oxide.Plugins
                     return null;
             }
 
-            if (!PlayerInventoryFull(player, item))
+            if (!PlayerInventoryFull(player, item, playerInventory.FindContainer(itemContainerId)))
                 return null;
 
             if (TryMoveItemToBackpack(player, item, item.amount))
@@ -457,29 +457,40 @@ namespace Oxide.Plugins
             return true;
         }
 
-        private bool PlayerInventoryFull(BasePlayer player, Item item)
+        private bool PlayerInventoryFull(BasePlayer player, Item item, ItemContainer? targetContainer = null)
         {
-            if (ContainerHasSpaceForItem(player.inventory.containerMain, item))
+            if (ContainerHasSpaceForItem(player.inventory.containerMain, item, targetContainer))
                 return false;
 
-            if (ContainerHasSpaceForItem(player.inventory.containerBelt, item))
+            if (ContainerHasSpaceForItem(player.inventory.containerBelt, item, targetContainer))
                 return false;
 
             return true;
         }
 
-        private bool ContainerHasSpaceForItem(ItemContainer container, Item item)
+        private bool ContainerHasSpaceForItem(ItemContainer container, Item item, ItemContainer? targetContainer = null)
         {
             foreach (Item existing in container.itemList)
             {
                 if (existing.info == item.info && existing.amount < existing.info.stackable)
                     return true;
 
-                if (existing.contents != null && existing.info.volume <= 4 && !existing.contents.IsFull())
+                if (targetContainer != null && HasAvailableSlot(targetContainer, item))
                     return true;
             }
 
             return container.itemList.Count < container.capacity;
+        }
+
+        private bool HasAvailableSlot(ItemContainer contents, Item item)
+        {
+            for (int i = 0; i < contents.capacity; i++)
+            {
+                if (contents.CanAcceptItem(item, i) == ItemContainer.CanAcceptResult.CanAccept)
+                    return true;
+            }
+
+            return false;
         }
 
         private bool TryMoveItemToBackpack(BasePlayer player, Item item, int amount)
